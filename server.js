@@ -7,8 +7,6 @@ const path = require('path');
 const fs = require('fs');
 
 const app = express();
-
-// Разрешаем запросы со всех источников (CORS)
 app.use(cors({ origin: '*' }));
 
 // --- НАСТРОЙКА ХРАНИЛИЩА ФАЙЛОВ ---
@@ -20,100 +18,113 @@ if (!fs.existsSync(uploadDir)) {
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadDir),
   filename: (req, file, cb) => {
-    // Сохраняем расширение файла и делаем имя уникальным
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    const ext = path.extname(file.originalname);
-    cb(null, uniqueSuffix + ext);
+    cb(null, uniqueSuffix + path.extname(file.originalname));
   }
 });
 
 const upload = multer({
   storage,
-  limits: { fileSize: 50 * 1024 * 1024 } // Лимит размера файла: 50 МБ
+  limits: { fileSize: 50 * 1024 * 1024 }
 });
 
-// Отдаём файлы из папки uploads по прямой ссылке: /uploads/имя_файла
 app.use('/uploads', express.static(uploadDir));
 
-// Эндпоинт загрузки файлов
 app.post('/upload', upload.single('file'), (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ success: false, message: 'Файл не был загружен' });
-  }
-
-  // Формируем прямую URL-ссылку на файл
+  if (!req.file) return res.status(400).json({ success: false, message: 'Файл не загружен' });
   const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
-  
-  res.json({
-    success: true,
-    url: fileUrl,
-    name: req.file.originalname,
-    size: req.file.size
-  });
+  res.json({ success: true, url: fileUrl, name: req.file.originalname });
 });
 
+// --- БАЗА ДАННЫХ И ПОЛЬЗОВАТЕЛИ ---
+const accounts = {}; // { nickname: password }
+const activeSockets = {}; // { socketId: { nickname, room } }
+const roomsList = new Set(['Общий чат']);
 
-// --- НАСТРОЙКА SOCKET.IO (ЧАТ И НИКНЕЙМЫ) ---
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: '*', methods: ['GET', 'POST'] }
-});
-
-// Хранилище пользователей в памяти: { socketId: { nickname, room } }
-const users = {};
+const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST'] } });
 
 io.on('connection', (socket) => {
 
-  // Регистрация никнейма
-  socket.on('set_nickname', (nickname, callback) => {
-    const isTaken = Object.values(users).some(
-      u => u.nickname.toLowerCase() === nickname.toLowerCase()
+  // Проверка существования никнейма и запрос пароля / авторизации
+  socket.on('auth_user', ({ nickname, password }, callback) => {
+    const cleanNick = nickname.trim().toLowerCase();
+
+    // Проверка на повторный вход с другого устройства
+    const isAlreadyOnline = Object.values(activeSockets).some(
+      u => u.nickname.toLowerCase() === cleanNick
     );
 
-    if (isTaken) {
-      return callback({ success: false, message: 'Этот никнейм уже занят!' });
+    if (isAlreadyOnline) {
+      return callback({ success: false, message: 'Этот аккаунт уже находится в сети на другом устройстве!' });
     }
 
-    users[socket.id] = { nickname, room: null };
-    callback({ success: true });
+    if (accounts[cleanNick]) {
+      // Пользователь существует -> проверяем пароль
+      if (accounts[cleanNick] === password) {
+        activeSockets[socket.id] = { nickname, room: null };
+        callback({ success: true, action: 'login', rooms: Array.from(roomsList) });
+        broadcastGlobalStats();
+      } else {
+        callback({ success: false, message: 'Неверный пароль!' });
+      }
+    } else {
+      // Новый аккаунт -> регистрируем
+      if (!password || password.length < 4) {
+        return callback({ success: false, message: 'Пароль должен содержать минимум 4 символа!' });
+      }
+      accounts[cleanNick] = password;
+      activeSockets[socket.id] = { nickname, room: null };
+      callback({ success: true, action: 'registered', rooms: Array.from(roomsList) });
+      broadcastGlobalStats();
+    }
   });
 
-  // Вход в комнату (чат)
-  socket.on('join_room', (room) => {
-    if (!users[socket.id]) return;
+  // Вход в комнату
+  socket.on('join_room', (roomName) => {
+    if (!activeSockets[socket.id]) return;
 
-    // Покидаем старые комнаты
     socket.rooms.forEach(r => { if (r !== socket.id) socket.leave(r); });
+    socket.join(roomName);
+    activeSockets[socket.id].room = roomName;
 
-    socket.join(room);
-    users[socket.id].room = room;
-
-    // Обновляем список пользователей онлайн в этой комнате
-    broadcastRoomUsers(room);
+    broadcastRoomUsers(roomName);
   });
 
-  // Отправка сообщений (текст или файл)
+  // Создание новой комнаты (синхронизируется со всеми)
+  socket.on('create_room', (roomName) => {
+    if (!roomName || roomsList.has(roomName)) return;
+    roomsList.add(roomName);
+    io.emit('room_created', roomName); // Рассылаем абсолютно всем
+  });
+
+  // Отправка сообщений
   socket.on('send_message', (data) => {
     io.to(data.room).emit('receive_message', data);
   });
 
-  // Отключение пользователя
+  // Отключение
   socket.on('disconnect', () => {
-    if (users[socket.id]) {
-      const room = users[socket.id].room;
-      delete users[socket.id];
+    if (activeSockets[socket.id]) {
+      const room = activeSockets[socket.id].room;
+      delete activeSockets[socket.id];
       if (room) broadcastRoomUsers(room);
+      broadcastGlobalStats();
     }
   });
 
   function broadcastRoomUsers(room) {
-    const roomUsers = Object.values(users)
+    const roomUsers = Object.values(activeSockets)
       .filter(u => u.room === room)
       .map(u => u.nickname);
-
     io.to(room).emit('update_users_list', roomUsers);
+  }
+
+  function broadcastGlobalStats() {
+    const totalOnline = Object.keys(activeSockets).length;
+    io.emit('global_online_count', totalOnline);
   }
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Единый сервер запущен на порту ${PORT}`));
+server.listen(PORT, () => console.log(`Сервер запущен на порту ${PORT}`));
