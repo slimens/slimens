@@ -9,7 +9,6 @@ const fs = require('fs');
 const app = express();
 app.use(cors({ origin: '*' }));
 
-// Настройка папки для файлов
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
@@ -26,30 +25,25 @@ app.post('/upload', upload.single('file'), (req, res) => {
   res.json({ success: true, url: fileUrl, name: req.file.originalname });
 });
 
-app.get('/', (req, res) => res.send('Slimens Server with History & Preset Passwords Active!'));
+app.get('/', (req, res) => res.send('Slimens Server Active!'));
 
-// --- ФАЙЛ ИСТОРИИ ЧАТА ---
+// Файл истории
 const HISTORY_FILE = path.join(__dirname, 'chat_history.json');
 let chatHistory = [];
 
-// Загрузка истории из файла при старте
 if (fs.existsSync(HISTORY_FILE)) {
   try {
-    const rawData = fs.readFileSync(HISTORY_FILE, 'utf8');
-    chatHistory = JSON.parse(rawData);
+    chatHistory = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
   } catch (e) {
-    console.error('Ошибка чтения истории:', e);
     chatHistory = [];
   }
 }
 
-// Функция сохранения истории в файл
 function saveHistory() {
   fs.writeFileSync(HISTORY_FILE, JSON.stringify(chatHistory, null, 2), 'utf8');
 }
 
-// --- 55 ПРЕДУСТАНОВЛЕННЫХ АККАУНТОВ ---
-// Создает список: user1: pass1, user2: pass2 ... user55: pass55
+// 55 предустановленных аккаунтов (user1: pass1 ... user55: pass55)
 const accounts = {};
 for (let i = 1; i <= 55; i++) {
   accounts[`user${i}`] = `pass${i}`;
@@ -63,36 +57,33 @@ const io = new Server(server, { cors: { origin: "*" } });
 
 io.on('connection', (socket) => {
 
-  // Авторизация по логину и предустановленному паролю
   socket.on('auth_user', ({ nickname, password }, callback) => {
     if (!callback) return;
     const cleanNick = nickname.trim().toLowerCase();
 
-    // 1. Проверка наличия пользователя в списке 55 аккаунтов
     if (!accounts[cleanNick]) {
       return callback({ 
         success: false, 
-        message: 'Неверный логин! Допустимы только логины от user1 до user55.' 
+        message: 'Неверный логин! Допустимы логины от user1 до user55.' 
       });
     }
 
-    // 2. Проверка пароля
     if (accounts[cleanNick] !== password) {
       return callback({ success: false, message: 'Неверный пароль!' });
     }
 
-    // 3. Проверка на повторный вход с другого устройства
-    const isAlreadyOnline = Object.values(activeSockets).some(
-      u => u.nickname.toLowerCase() === cleanNick
-    );
-
-    if (isAlreadyOnline) {
-      return callback({ success: false, message: 'Этот аккаунт уже находится в сети на другом устройстве!' });
+    // Автоматически завершаем старое зависшее соединение этого пользователя
+    for (const [sId, uData] of Object.entries(activeSockets)) {
+      if (uData.nickname.toLowerCase() === cleanNick) {
+        delete activeSockets[sId];
+        const oldSocket = io.sockets.sockets.get(sId);
+        if (oldSocket) oldSocket.disconnect(true);
+      }
     }
 
+    // Регистрируем новое соединение
     activeSockets[socket.id] = { nickname: cleanNick, room: null };
 
-    // Возвращаем успех, список комнат и историю сообщений
     callback({ 
       success: true, 
       rooms: Array.from(roomsList),
@@ -102,7 +93,6 @@ io.on('connection', (socket) => {
     broadcastGlobalStats();
   });
 
-  // Вход в комнату
   socket.on('join_room', (roomName) => {
     if (!activeSockets[socket.id]) return;
     socket.rooms.forEach(r => { if (r !== socket.id) socket.leave(r); });
@@ -111,24 +101,18 @@ io.on('connection', (socket) => {
     broadcastRoomUsers(roomName);
   });
 
-  // Создание новой комнаты
   socket.on('create_room', (roomName) => {
     if (!roomName || roomsList.has(roomName)) return;
     roomsList.add(roomName);
     io.emit('room_created', roomName);
   });
 
-  // Отправка сообщений и сохранение в файл history
   socket.on('send_message', (data) => {
-    // Добавляем сообщение в массив и сохраняем на диск
     chatHistory.push(data);
     saveHistory();
-
-    // Рассылаем всем участникам
     io.to(data.room).emit('receive_message', data);
   });
 
-  // Отключение
   socket.on('disconnect', () => {
     if (activeSockets[socket.id]) {
       const room = activeSockets[socket.id].room;
