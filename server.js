@@ -9,25 +9,15 @@ const fs = require('fs');
 const app = express();
 app.use(cors({ origin: '*' }));
 
-// --- НАСТРОЙКА ХРАНИЛИЩА ФАЙЛОВ ---
+// Настройка папки для файлов
 const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
-}
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, uniqueSuffix + path.extname(file.originalname));
-  }
+  filename: (req, file, cb) => cb(null, Date.now() + '-' + Math.round(Math.random() * 1E9) + path.extname(file.originalname))
 });
-
-const upload = multer({
-  storage,
-  limits: { fileSize: 50 * 1024 * 1024 }
-});
-
+const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
 app.use('/uploads', express.static(uploadDir));
 
 app.post('/upload', upload.single('file'), (req, res) => {
@@ -36,21 +26,62 @@ app.post('/upload', upload.single('file'), (req, res) => {
   res.json({ success: true, url: fileUrl, name: req.file.originalname });
 });
 
-// --- БАЗА ДАННЫХ И ПОЛЬЗОВАТЕЛИ ---
-const accounts = {}; // { nickname: password }
+app.get('/', (req, res) => res.send('Slimens Server with History & Preset Passwords Active!'));
+
+// --- ФАЙЛ ИСТОРИИ ЧАТА ---
+const HISTORY_FILE = path.join(__dirname, 'chat_history.json');
+let chatHistory = [];
+
+// Загрузка истории из файла при старте
+if (fs.existsSync(HISTORY_FILE)) {
+  try {
+    const rawData = fs.readFileSync(HISTORY_FILE, 'utf8');
+    chatHistory = JSON.parse(rawData);
+  } catch (e) {
+    console.error('Ошибка чтения истории:', e);
+    chatHistory = [];
+  }
+}
+
+// Функция сохранения истории в файл
+function saveHistory() {
+  fs.writeFileSync(HISTORY_FILE, JSON.stringify(chatHistory, null, 2), 'utf8');
+}
+
+// --- 55 ПРЕДУСТАНОВЛЕННЫХ АККАУНТОВ ---
+// Создает список: user1: pass1, user2: pass2 ... user55: pass55
+const accounts = {};
+for (let i = 1; i <= 55; i++) {
+  accounts[`user${i}`] = `pass${i}`;
+}
+
 const activeSockets = {}; // { socketId: { nickname, room } }
 const roomsList = new Set(['Общий чат']);
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST'] } });
+const io = new Server(server, { cors: { origin: "*" } });
 
 io.on('connection', (socket) => {
 
-  // Проверка существования никнейма и запрос пароля / авторизации
+  // Авторизация по логину и предустановленному паролю
   socket.on('auth_user', ({ nickname, password }, callback) => {
+    if (!callback) return;
     const cleanNick = nickname.trim().toLowerCase();
 
-    // Проверка на повторный вход с другого устройства
+    // 1. Проверка наличия пользователя в списке 55 аккаунтов
+    if (!accounts[cleanNick]) {
+      return callback({ 
+        success: false, 
+        message: 'Неверный логин! Допустимы только логины от user1 до user55.' 
+      });
+    }
+
+    // 2. Проверка пароля
+    if (accounts[cleanNick] !== password) {
+      return callback({ success: false, message: 'Неверный пароль!' });
+    }
+
+    // 3. Проверка на повторный вход с другого устройства
     const isAlreadyOnline = Object.values(activeSockets).some(
       u => u.nickname.toLowerCase() === cleanNick
     );
@@ -59,47 +90,41 @@ io.on('connection', (socket) => {
       return callback({ success: false, message: 'Этот аккаунт уже находится в сети на другом устройстве!' });
     }
 
-    if (accounts[cleanNick]) {
-      // Пользователь существует -> проверяем пароль
-      if (accounts[cleanNick] === password) {
-        activeSockets[socket.id] = { nickname, room: null };
-        callback({ success: true, action: 'login', rooms: Array.from(roomsList) });
-        broadcastGlobalStats();
-      } else {
-        callback({ success: false, message: 'Неверный пароль!' });
-      }
-    } else {
-      // Новый аккаунт -> регистрируем
-      if (!password || password.length < 4) {
-        return callback({ success: false, message: 'Пароль должен содержать минимум 4 символа!' });
-      }
-      accounts[cleanNick] = password;
-      activeSockets[socket.id] = { nickname, room: null };
-      callback({ success: true, action: 'registered', rooms: Array.from(roomsList) });
-      broadcastGlobalStats();
-    }
+    activeSockets[socket.id] = { nickname: cleanNick, room: null };
+
+    // Возвращаем успех, список комнат и историю сообщений
+    callback({ 
+      success: true, 
+      rooms: Array.from(roomsList),
+      history: chatHistory
+    });
+
+    broadcastGlobalStats();
   });
 
   // Вход в комнату
   socket.on('join_room', (roomName) => {
     if (!activeSockets[socket.id]) return;
-
     socket.rooms.forEach(r => { if (r !== socket.id) socket.leave(r); });
     socket.join(roomName);
     activeSockets[socket.id].room = roomName;
-
     broadcastRoomUsers(roomName);
   });
 
-  // Создание новой комнаты (синхронизируется со всеми)
+  // Создание новой комнаты
   socket.on('create_room', (roomName) => {
     if (!roomName || roomsList.has(roomName)) return;
     roomsList.add(roomName);
-    io.emit('room_created', roomName); // Рассылаем абсолютно всем
+    io.emit('room_created', roomName);
   });
 
-  // Отправка сообщений
+  // Отправка сообщений и сохранение в файл history
   socket.on('send_message', (data) => {
+    // Добавляем сообщение в массив и сохраняем на диск
+    chatHistory.push(data);
+    saveHistory();
+
+    // Рассылаем всем участникам
     io.to(data.room).emit('receive_message', data);
   });
 
@@ -121,10 +146,9 @@ io.on('connection', (socket) => {
   }
 
   function broadcastGlobalStats() {
-    const totalOnline = Object.keys(activeSockets).length;
-    io.emit('global_online_count', totalOnline);
+    io.emit('global_online_count', Object.keys(activeSockets).length);
   }
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Сервер запущен на порту ${PORT}`));
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
